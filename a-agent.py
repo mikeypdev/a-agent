@@ -107,16 +107,25 @@ def thinking_request_params(enabled: bool = True) -> dict:
 def adjust_max_tokens_for_thinking(
     base_max_tokens: int,
     model_max_tokens: int,
+    context_window: int,
+    used_tokens: int,
     level: str = "high",
 ) -> int:
+    # Ensure input + output never exceeds context_window.
+    # available = how many tokens remain for output after input.
+    available = context_window - used_tokens
+    if available <= 1024:
+        return 0
+
     if not THINKING:
-        return base_max_tokens
-    budget = THINKING_BUDGETS.get(level, 8192)
-    adjusted = min(base_max_tokens + budget, model_max_tokens)
-    min_output = 1024
-    if adjusted <= budget:
-        adjusted = model_max_tokens
-    return max(adjusted, min_output)
+        # No thinking budget needed — cap output at available space minus buffer.
+        return max(512, min(base_max_tokens, available - 1024))
+
+    # Thinking models use internal tokens for reasoning (not counted in max_tokens).
+    # Budget for internal reasoning steps from the available space.
+    budget = min(THINKING_BUDGETS.get(level, 8192), available // 2)
+    adjusted = min(base_max_tokens + budget, model_max_tokens, available - 1024)
+    return max(adjusted, 512)
 
 
 _base       = urllib.parse.urlparse(API_BASE)
@@ -1650,8 +1659,10 @@ def _run_agent_loop(prompt: str, history: list, model_info: dict) -> None:
             ctx = _context_str(history, model_info["context_window"])
             display.print(f"[dim]⚡ Context compacted – older messages summarized.  Context: {ctx}[/dim]\n")
 
+        used_tokens = estimate_tokens(history)
         turn_max = adjust_max_tokens_for_thinking(
-            model_info["max_tokens"], model_info["max_tokens"]
+            model_info["max_tokens"], model_info["max_tokens"],
+            model_info["context_window"], used_tokens
         )
 
         content_buf: list[str] = []
