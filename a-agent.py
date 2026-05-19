@@ -89,16 +89,25 @@ THINKING_BUDGETS = {
     "high":    16384,
 }
 
-REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
-
+REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text", "thinking")
 
 def thinking_request_params(enabled: bool = True) -> dict:
+    """Build thinking/reasoning parameters based on model and format."""
     if not enabled:
         if THINKING_FORMAT == "openrouter":
             return {"reasoning": {"effort": "none"}}
+        # For z.ai, return empty dict (no parameter needed to disable)
         return {}
+
     if THINKING_FORMAT == "openrouter":
-        return {"reasoning": {"effort": "high"}}
+        # Build thinking params - include_reasoning ensures we get the reasoning
+        # content in the response, not just as an internal token budget
+        params = {
+            "include_reasoning": True,
+        }
+        # Add reasoning effort for models that support it
+        params["reasoning"] = {"effort": "high"}
+        return params
     if THINKING_FORMAT == "zai":
         return {"thinking": {"type": "enabled"}}
     return {"reasoning_effort": "high"}
@@ -124,7 +133,10 @@ def adjust_max_tokens_for_thinking(
     # Thinking models use internal tokens for reasoning (not counted in max_tokens).
     # Budget for internal reasoning steps from the available space.
     budget = min(THINKING_BUDGETS.get(level, 8192), available // 2)
-    adjusted = min(base_max_tokens + budget, model_max_tokens, available - 1024)
+    
+    # Cap output at base_max_tokens, respecting available space and allowing
+    # the thinking budget to increase capacity slightly for reasoning models.
+    adjusted = min(base_max_tokens + budget, available - 1024)
     return max(adjusted, 512)
 
 
@@ -630,13 +642,19 @@ def fetch_model_info(model_id: str) -> dict:
         if resp.status == 200:
             data = json.loads(raw)
             m = data.get("data", data)
+            context_window = m.get("context_length") or DEFAULT_MODEL_INFO["context_window"]
+            max_tokens = (
+                m.get("top_provider", {}).get("max_completion_tokens")
+                or m.get("max_completion_tokens")
+                or DEFAULT_MODEL_INFO["max_tokens"]
+            )
+            # Sanity check: if max_tokens is nearly the entire context, that's not a
+            # meaningful limit — the model is saying "no specific cap". Use a sensible default.
+            if max_tokens > context_window * 0.5:
+                max_tokens = DEFAULT_MODEL_INFO["max_tokens"]
             info = {
-                "context_window": m.get("context_length") or DEFAULT_MODEL_INFO["context_window"],
-                "max_tokens": (
-                    m.get("top_provider", {}).get("max_completion_tokens")
-                    or m.get("max_completion_tokens")
-                    or DEFAULT_MODEL_INFO["max_tokens"]
-                ),
+                "context_window": context_window,
+                "max_tokens": max_tokens,
             }
             _model_info_cache = info
             return info
@@ -653,12 +671,18 @@ def fetch_model_info(model_id: str) -> dict:
             data = json.loads(raw)
             for m in data.get("data", []):
                 if m.get("id") == model_id:
+                    context_window = m.get("context_length") or DEFAULT_MODEL_INFO["context_window"]
+                    max_tokens = (
+                        m.get("top_provider", {}).get("max_completion_tokens")
+                        or m.get("max_completion_tokens")
+                        or DEFAULT_MODEL_INFO["max_tokens"]
+                    )
+                    # Sanity check: same as above
+                    if max_tokens > context_window * 0.5:
+                        max_tokens = DEFAULT_MODEL_INFO["max_tokens"]
                     info = {
-                        "context_window": m.get("context_length") or DEFAULT_MODEL_INFO["context_window"],
-                        "max_tokens": (
-                            m.get("top_provider", {}).get("max_completion_tokens")
-                            or DEFAULT_MODEL_INFO["max_tokens"]
-                        ),
+                        "context_window": context_window,
+                        "max_tokens": max_tokens,
                     }
                     _model_info_cache = info
                     return info
@@ -1327,10 +1351,52 @@ _tool_runner = ToolRunner()
 # ---------------------------------------------------------------------------
 
 def _msg_tokens(msg: dict) -> int:
-    return len(json.dumps(msg)) // 4
+    """Estimate tokens in a message using a more accurate heuristic.
+    
+    Uses character count divided by encoding ratio, plus JSON overhead.
+    - Non-Asian chars: ~4 chars per token
+    - Asian chars: ~2 chars per token  
+    - JSON overhead: ~10-20 chars for {"role": ..., "content": ...}
+    """
+    # Start with JSON overhead estimate
+    overhead = 20
+    
+    # Get the text content - handle both string and tool_calls messages
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        # Handle content that's a list of content blocks (e.g., text + images)
+        text = ""
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text += block.get("text", "")
+            elif isinstance(block, str):
+                text += block
+    else:
+        text = str(content) if content else ""
+    
+    if not text:
+        # For messages without text content (tool calls, etc.), use JSON length
+        return len(json.dumps(msg)) // 4
+    
+    # Count characters and estimate tokens
+    # Use a dynamic ratio: if content has high density of Asian chars, use 2, else 4
+    asian_chars = sum(1 for c in text if ord(c) > 0x2E7F)  # CJK unified ideographs
+    total_chars = len(text)
+    if total_chars > 10:
+        # Weighted ratio: if >30% Asian chars, use lower ratio
+        asian_ratio = asian_chars / total_chars
+        ratio = 4 - (asian_ratio * 2)  # Range: 2 (high Asian) to 4 (low Asian)
+    else:
+        ratio = 4  # Default for short text
+    
+    text_tokens = len(text) / ratio
+    return int(text_tokens) + overhead
 
 
 def estimate_tokens(messages: list) -> int:
+    """Estimate total tokens across all messages."""
     return sum(_msg_tokens(m) for m in messages)
 
 
